@@ -5,6 +5,8 @@
 set -e
 cd "$(dirname "$0")"
 export PATH="$HOME/workspace/tools/go/bin:$PATH"
+# CGO_ENABLED=0: fully static binaries, run on any Linux (old glibc OK)
+export CGO_ENABLED=0
 
 GOOS=linux GOARCH=amd64 go build -o bin/gs_tun_server ./gs_tun_server
 GOOS=linux GOARCH=amd64 go build -o bin/gs_tun_client  ./gs_tun_client
