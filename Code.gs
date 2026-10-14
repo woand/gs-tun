@@ -21,6 +21,12 @@ var MAX_WAIT = 90;               // below the Apps Script execution limit
 var MAX_PUSH_PACKETS = 16;       // keep one request comfortably small
 var MAX_POLL_PACKETS = 32;
 var MAX_QUEUE_PACKETS = 512;     // lossy backpressure: discard oldest entries
+// LockService is global to this script. Never let one contending mailbox
+// request park for 15 seconds: KCP above this bus already handles loss and
+// retransmission. A short lock attempt turns contention into a cheap retry.
+var LOCK_TRY_MS = 250;
+var POLL_SLEEP_MIN_MS = 50;
+var POLL_SLEEP_MAX_MS = 250;
 
 function getToken_() {
   var t = PropertiesService.getScriptProperties().getProperty('TOKEN');
@@ -82,7 +88,11 @@ function push_(b) {
   cache.putAll(values, CHUNK_TTL);
 
   var lock = LockService.getScriptLock();
-  lock.waitLock(15000);
+  if (!lock.tryLock(LOCK_TRY_MS)) {
+    // gasclient treats an HTTP/application error as packet loss; KCP will
+    // retransmit the datagram instead of allowing this request to stall.
+    return j_({error: 'busy'});
+  }
   try {
     var qkey = qkey_(b.sess, b.dir, b.stream);
     var queue = [];
@@ -109,11 +119,24 @@ function push_(b) {
 // and deletes the packet values. The operation is intentionally destructive.
 function pop_(b, maxPackets) {
   var cache = CacheService.getScriptCache();
+  var qkey = qkey_(b.sess, b.dir, b.stream);
+
+  // The overwhelmingly common long-poll path is an empty queue. Avoid
+  // taking the global script lock just to discover that there is no data.
+  // Re-read the queue after acquiring the lock to close the push/pop race.
+  var preview = cache.get(qkey);
+  if (!preview) return [];
+  try {
+    var previewQueue = JSON.parse(preview);
+    if (!Array.isArray(previewQueue) || previewQueue.length === 0) return [];
+  } catch (ignorePreview) {
+    return [];
+  }
+
   var lock = LockService.getScriptLock();
-  lock.waitLock(15000);
+  if (!lock.tryLock(LOCK_TRY_MS)) return null;
   var keys;
   try {
-    var qkey = qkey_(b.sess, b.dir, b.stream);
     var queue = [];
     var raw = cache.get(qkey);
     if (raw) {
@@ -140,12 +163,19 @@ function pop_(b, maxPackets) {
 function poll_(b) {
   var wait = Math.min(Math.max(parseInt(b.wait || 75, 10), 1), MAX_WAIT);
   var deadline = Date.now() + wait * 1000;
-  var sleepMs = 100;
+  var sleepMs = POLL_SLEEP_MIN_MS;
   while (true) {
     var packets = pop_(b, MAX_POLL_PACKETS);
+    if (packets === null) {
+      // Another push/pop briefly owns the script lock. Retry inside this
+      // execution without exposing a 15-second LockService stall.
+      if (Date.now() >= deadline) return j_({packets: []});
+      Utilities.sleep(POLL_SLEEP_MIN_MS);
+      continue;
+    }
     if (packets.length > 0) return j_({packets: packets});
     if (Date.now() >= deadline) return j_({packets: []});
     Utilities.sleep(sleepMs);
-    sleepMs = Math.min(sleepMs + 100, 500);
+    sleepMs = Math.min(sleepMs + 50, POLL_SLEEP_MAX_MS);
   }
 }
