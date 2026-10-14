@@ -75,6 +75,17 @@ curl -x socks5://127.0.0.1:18080 https://example.com
 ```
 
 两个 secret 分工：`--token` 是 GAS 总线鉴权（防别人蹭你的 URL），
+多 server：一个 token 可以带多个 gs_tun_server。server 启动时根据主机名自动生成稳定的 server id 并打印出来，客户端用 `--sv <id>` 选择连哪台：
+
+```
+./gs_tun_server --gs <exec> --token <TOKEN>
+# server id: 663ff19a  (clients use --sv 663ff19a)
+
+./gs_tun_client --gs <exec> --token <TOKEN> --sv 663ff19a -l 127.0.0.1:18080
+```
+
+不同 server 的 bus 命名空间完全隔离，不会互相干扰。
+
 `--token` 既是 GAS 总线鉴权也是唯一的密钥：传输层是 HTTPS（TLS），总线按 token 隔离，无 token 者无法使用你的 gs URL，所以不需要单独的 KCP 密钥。
 client 启动会打印配对好的 server 命令行。
 

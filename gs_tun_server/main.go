@@ -5,9 +5,11 @@
 //
 // ./gs_tun_server --gs https://script.google.com/macros/s/.../exec \
 //   --token <TOKEN>
+// Server prints its id at startup; clients select it with --sv <id>.
 package main
 
 import (
+	"fmt"
 	"encoding/json"
 	"flag"
 	"log"
@@ -86,7 +88,11 @@ func main() {
 		cfg.Service = "fast"
 	}
 
-	sess := gaspacket.SessForToken(*token)
+	// Multi-server: each server gets a stable ID derived from its hostname,
+	// and the bus namespace includes it, so one token can serve many servers.
+	serverID := gaspacket.ServerID(*token)
+	sess := gaspacket.SessForTokenAndServer(*token, serverID)
+	fmt.Printf("server id: %s  (clients use --sv %s)\n", serverID, serverID)
 	gc := gasclient.New(*gsURL, *token, sess)
 
 	listenKCP := func(block kcp.BlockCrypt) (*kcp.Listener, func(), error) {

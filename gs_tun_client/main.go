@@ -2,7 +2,7 @@
 // a KCP session whose datagrams ride the GAS doPost bus (no UDP sockets).
 //
 // ./gs_tun_client --gs https://script.google.com/macros/s/.../exec \
-//   --token <TOKEN> -l 127.0.0.1:18080
+//   --token <TOKEN> --sv <SERVER_ID> -l 127.0.0.1:18080
 package main
 
 import (
@@ -23,6 +23,7 @@ import (
 func main() {
 	gsURL := flag.String("gs", "", "GAS /exec URL (required)")
 	token := flag.String("token", "", "bus auth token (required)")
+	sv := flag.String("sv", "", "target server id (from server's startup log; required when servers use ids)")
 	localAddr := flag.String("l", ":12948", "local TCP listen addr (socks5 proxy)")
 	mode := flag.String("mode", "fast", "fast3, fast2, fast, normal, manual")
 	mtu := flag.Int("mtu", 1350, "MTU for KCP datagrams")
@@ -78,7 +79,7 @@ func main() {
 		cfg.Service = "socks5"
 	}
 
-	sess := gaspacket.SessForToken(*token)
+	sess := gaspacket.SessForTokenAndServer(*token, *sv)
 	gc := gasclient.New(*gsURL, *token, sess)
 
 	ann, err := gaspacket.NewAnnouncer(gc)

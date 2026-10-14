@@ -8,6 +8,7 @@
 package gaspacket
 
 import (
+	"os"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -26,8 +27,28 @@ const Stream = "dgram"
 // SessForToken derives the bus namespace from the token so both ends agree
 // without a --sess flag. One token == one client<->server pair.
 func SessForToken(token string) string {
-	sum := sha256.Sum256([]byte("gs-tun:" + token))
+	return SessForTokenAndServer(token, "")
+}
+
+// SessForTokenAndServer derives the bus namespace from token + server ID,
+// so one token can serve multiple gs_tun_server instances. The client
+// selects the target with --sv <server-id>. An empty serverID falls back
+// to the legacy single-server namespace.
+func SessForTokenAndServer(token, serverID string) string {
+	sum := sha256.Sum256([]byte("gs-tun:" + token + ":sv:" + serverID))
 	return "g-" + hex.EncodeToString(sum[:])[:12]
+}
+
+// ServerID generates a stable server identifier from the machine's
+// characteristics (hostname) bound to the token. Same host + same token
+// always yields the same ID, so clients can rely on --sv across restarts.
+func ServerID(token string) string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown-host"
+	}
+	sum := sha256.Sum256([]byte("gs-tun-sv:" + token + ":" + host))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 type fakeAddr string
