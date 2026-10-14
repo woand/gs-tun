@@ -3,15 +3,16 @@
 // The built-in proxy is always on: the paired gs_tun_client acts as a
 // socks5 proxy, this end dials whatever the client asks for.
 //
-// ./gs_tun_server --gs https://script.google.com/macros/s/.../exec \
-//   --token <TOKEN>
+//	./gs_tun_server --gs https://script.google.com/macros/s/.../exec \
+//	  --token <TOKEN>
+//
 // Server prints its id at startup; clients select it with --sv <id>.
 package main
 
 import (
-	"fmt"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -32,8 +33,8 @@ func main() {
 	mtu := flag.Int("mtu", 1350, "MTU for KCP datagrams")
 	sndwnd := flag.Int("sndwnd", 1024, "send window (packets)")
 	rcvwnd := flag.Int("rcvwnd", 1024, "receive window (packets)")
-	ds := flag.Int("ds", 10, "FEC datashard")
-	ps := flag.Int("ps", 3, "FEC parityshard")
+	ds := flag.Int("ds", 0, "FEC datashard (0 disables FEC for the reliable GAS/KCP path)")
+	ps := flag.Int("ps", 0, "FEC parityshard (0 disables FEC for the reliable GAS/KCP path)")
 	dscp := flag.Int("dscp", 0, "DSCP value")
 	nocomp := flag.Bool("nocomp", false, "disable compression")
 	sockbuf := flag.Int("sockbuf", 4*1024*1024, "per-session buffer in bytes")
@@ -100,21 +101,6 @@ func main() {
 	fmt.Printf("server id: %s  (clients use --sv %s)\n", serverID, serverID)
 	gc := gasclient.New(*gsURL, *token, sess)
 
-	listenKCP := func(block kcp.BlockCrypt) (*kcp.Listener, func(), error) {
-		gp, err := gaspacket.Dial(gc, "down", "up")
-		if err != nil {
-			return nil, nil, err
-		}
-		lis, err := kcp.ServeConn(block, cfg.DataShard, cfg.ParityShard, gp)
-		if err != nil {
-			gp.Close()
-			return nil, nil, err
-		}
-		// lis.Close() already closes the underlying conn; the extra
-		// gp.Close() is a harmless idempotent backup.
-		return lis, func() { gp.Close() }, nil
-	}
-
 	// One handler per client run. A new run ID means the client built a new
 	// KCP session (new conv); the old listener is torn down so its stale
 	// session entry can never blackhole the new conv. The announce stream
@@ -135,6 +121,20 @@ func main() {
 		curRun = runID
 		stopCh = make(chan struct{})
 		rid := runID
+		runGC := gasclient.New(*gsURL, *token,
+			gaspacket.SessForRun(*token, serverID, runID))
+		listenKCP := func(block kcp.BlockCrypt) (*kcp.Listener, func(), error) {
+			gp, err := gaspacket.Dial(runGC, "down", "up")
+			if err != nil {
+				return nil, nil, err
+			}
+			lis, err := kcp.ServeConn(block, cfg.DataShard, cfg.ParityShard, gp)
+			if err != nil {
+				gp.Close()
+				return nil, nil, err
+			}
+			return lis, func() { gp.Close() }, nil
+		}
 		log.Printf("client run %s: starting KCP listener", rid)
 		go func() {
 			if err := kcpserver.Run(cfg, listenKCP, stopCh); err != nil {

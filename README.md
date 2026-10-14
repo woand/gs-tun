@@ -17,14 +17,13 @@ KCP 会话跑在**虚拟 PacketConn** 上——**零 UDP socket、零 unix socke
 
 ## 文件
 
-- `Code.gs` — GAS 端：`doPost` 实现 `push`/`poll`，token 鉴权，per-(sess,dir,stream)
-  FIFO 队列（CacheService，单条 ≤100KB，TTL 600s），`LockService` 保护写，
-  长轮询最长挂 90 秒（< 6 分钟单次执行上限）。
-- `gasclient/` — Go 客户端库：`Push`（重试幂等，`DesyncError` 可恢复）、`Poll`（长轮询）。
-- `gaspacket/` — 虚拟 `net.PacketConn`：一个 KCP 数据报 = 一次 bus `push`，
-  包边界严格保留；`WriteTo` 永不阻塞（异步发送队列，不卡 kcp-go 的 update 循环）；
-  启动时学 tail 跳过旧数据；`SessForToken()` 从 token 派生 sess（两端自动一致，
-  无需 `--sess`）；`__announce__` 流跑 client run 心跳（见下）。
+- `Code.gs` — GAS 端：`doPost` 实现有损 `push`/`poll` mailbox，token 鉴权，
+  临时 CacheService 索引和取走即删的批量数据报，长轮询最长挂 90 秒。
+- `gasclient/` — Go 客户端库：批量 `PushBatch` 和长轮询 `Poll`；不在 GAS 层重试、
+  去重或确认数据包。
+- `gaspacket/` — 虚拟 `net.PacketConn`：一个 KCP 数据报保持一个 mailbox item；
+  `WriteTo` 永不阻塞，发送端以 16 包/25ms 聚合并用 4 个有界 HTTP worker 并行 push；
+  每次 KCP run 使用独立 sess，避免重启时读到旧数据；`__announce__` 流跑 client 心跳。
 - `kcpclient/`、`kcpserver/` — 从 diyism/kcptunB 移植的 client/server
   （`package main` → 库，`main()` → `Run()`；client 的 `DialWithOptions` 和
   server 的 `unix:/UDP listen` 被替换为注入的虚 conn 构造；其余 flags/smux/
@@ -37,19 +36,18 @@ KCP 会话跑在**虚拟 PacketConn** 上——**零 UDP socket、零 unix socke
 
 ## 关键设计（实测踩出来的）
 
-1. **虚 conn 必须异步写**：kcp-go 的全局 updater 同步调 `WriteTo`，
-   一次 HTTPS POST（真 GAS 上 1~3 秒）会卡死整个 KCP 时钟。`WriteTo`
-   只入队（4096），sender goroutine 慢慢 push；队满丢包（KCP 重传兜底）。
-2. **announce 协议防黑洞**：kcp-go server 按源地址分 session，
+1. **GAS 只做有损中继**：GAS 不再维护 KCP 之外的 seq、ACK、重试、去重或可靠 FIFO。
+   丢失、重复和乱序都交给 KCP 处理。
+2. **批量并行发送**：kcp-go 的全局 updater 同步调 `WriteTo`，因此 `WriteTo`
+   只入队；sender 每最多 16 个数据报或等待 25ms 聚合一次，并以 4 个 worker
+   并行 push。队满或 HTTP 失败都按丢包处理，由 KCP 重传。
+3. **announce 协议防黑洞**：kcp-go server 按源地址分 session，
    虚 conn 的源地址是常量——client 重连换 conv 后，新包会被喂进旧 session
    因 conv 不匹配而丢弃，且 v5 的 Listener 不自动淘汰。解法：client 每次建
    KCP 会话生成 runID 推到 `__announce__` 流（2 分钟一次心跳），server 见
    runID 变化就 `Close()` 旧 listener 重建。client/server 任一重启都能恢复。
-3. **sess 从 token 派生**：`g-<sha256("gs-tun:"+token)[:12]>`，两端自动一致，
-   去掉了 `--sess` 参数。**一个 token = 一对 client/server**，不要多开。
-4. **重启不脏读**：虚 conn 启动时学 tail，跳过 600s TTL 窗口内的旧数据报；
-   push 遇到 `{ok:false, expect}` 自动采纳 server 的 seq 重发（数据报是原子的，
-   不像流需要重切分）。
+4. **run 独立 mailbox**：控制 announce 使用 token/server 的基础 sess；每次 KCP
+   run 使用 `SessForRun(token, server, runID)`，不再依赖启动时扫描旧 tail。
 
 ## 部署 GAS（需在浏览器里手动做一次）
 
@@ -100,10 +98,9 @@ client 启动会打印配对好的 server 命令行。
 - 4 路并发 5MB 下载：4/4 字节全对（smux 多路复用正常）。
 - client 重启：新 runID announce → server teardown 旧 listener → 重建，
   隧道自动恢复，curl 照通。
-- **这是 loopback+mockgas 的数字**。经 script.google.com 时，
-  每个 KCP 数据报 = 一次 HTTPS POST（1~3 秒），吞吐瓶颈在 POST 粒度：
-  估算持续吞吐 **KB/s 量级**——SSH/终端/轻量代理可用，大文件不合适。
-  后续优化方向：一次 POST 打包 N 个数据报（batching）。
+- **这是 loopback+mockgas 的数字**。经 script.google.com 时，GAS 仍受 HTTPS
+  请求处理速度限制；批量和并行只降低 POST 粒度，不能把 Apps Script 变成真正的
+  持续上行流。实际公网吞吐和交互延迟仍需用真实 `/exec` 测量。
 
 ## 配额（consumer Gmail 账号，2026 口径）
 
@@ -116,9 +113,8 @@ client 启动会打印配对好的 server 命令行。
 
 ## 已知限制
 
-- 下行延迟 = 长轮询粒度（~1s）+ RTT；真 GAS 上每个数据报一次 POST，
-  不适合实时游戏/高频交易/大文件。
-- 一个 token 只支持一对 client/server（bus 层 seq 是单 writer 假设）。
+- GAS mailbox 仍受 CacheService 淘汰、Apps Script 并发和 HTTP 请求延迟影响；
+  它适合 SSH/轻量代理，不应视为稳定的大文件传输层。
 - PoC 质量：没有 metrics，日志简陋；`--conn` 写死 1。
-- `Code.gs` 未经真实 script.google.com 部署验证（mockgas 只覆盖了协议逻辑）；
+- `Code.gs` 的真实 script.google.com 行为仍需部署验证（mockgas 只覆盖协议逻辑）；
   部署后先跑 `./test-kcp.sh`（`GS_URL`/`TOKEN` 环境变量指向真 GAS）。

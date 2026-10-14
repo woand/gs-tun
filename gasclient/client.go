@@ -1,4 +1,9 @@
-// Package gasclient speaks the gscript-tunnel GAS doPost protocol.
+// Package gasclient speaks the lossy gscript-tunnel GAS mailbox protocol.
+//
+// GAS is deliberately not a reliable transport here. A push only hands a
+// batch of opaque packets to the temporary mailbox; packets may be lost,
+// duplicated, or delivered out of order. KCP above this package owns
+// ordering, acknowledgement, retransmission, and flow control.
 package gasclient
 
 import (
@@ -14,13 +19,9 @@ import (
 // CtlStream is the reserved control stream (dir "up").
 const CtlStream = "__ctl__"
 
-// Chunk is one ordered payload unit from a poll response.
-type Chunk struct {
-	Seq  int
-	Data []byte
-	Fin  bool
-}
-
+// Client is a thin HTTP client for the GAS mailbox. Calls are intentionally
+// single-attempt: retrying a push at this layer would create duplicates and
+// would duplicate the reliability machinery already provided by KCP.
 type Client struct {
 	URL, Token, Sess string
 	HC               *http.Client
@@ -30,120 +31,92 @@ func New(url, token, sess string) *Client {
 	return &Client{
 		URL: url, Token: token, Sess: sess,
 		HC: &http.Client{Timeout: 150 * time.Second}, // > max long-poll hold (90s)
-		// NOTE: GAS /exec answers every POST with a 302 to a googleusercontent
-		// echo URL. Go's default redirect policy turns the follow-up into a
-		// bodyless GET, which is exactly right: GAS replays the original POST
-		// body against doPost and returns its output. Do NOT override
-		// CheckRedirect here.
+		// GAS /exec normally answers with a redirect. Keep the default
+		// redirect policy because it is part of the deployed web-app path.
 	}
 }
 
-// call POSTs one JSON body and returns the decoded JSON response.
-// The GAS 302 -> GET dance is handled by the http.Client's default redirect
-// policy (see New). Retries transient transport failures. Push stays
-// idempotent because the server dedups by seq (seq <= tail -> {ok, dup}).
+// call sends one mailbox operation. It has no application-level retry.
+// A failed push is intentionally treated as packet loss and KCP will resend
+// the packet when its own ACK is not received.
 func (c *Client) call(body map[string]any) (map[string]any, error) {
 	body["token"] = c.Token
 	body["sess"] = c.Sess
-	raw, _ := json.Marshal(body)
-	var last error
-	for attempt := 0; attempt < 6; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-		req, err := http.NewRequest("POST", c.URL, bytes.NewReader(raw))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := c.HC.Do(req)
-		if err != nil {
-			last = err
-			continue
-		}
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			last = err
-			continue
-		}
-		if resp.StatusCode/100 != 2 {
-			last = fmt.Errorf("gas http %d: %.120s", resp.StatusCode, string(data))
-			continue
-		}
-		var out map[string]any
-		if err := json.Unmarshal(data, &out); err != nil {
-			last = err
-			continue
-		}
-		if em, ok := out["error"].(string); ok && em != "" {
-			return nil, fmt.Errorf("gas error: %s", em)
-		}
-		return out, nil
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("gas unreachable: %w", last)
+	req, err := http.NewRequest("POST", c.URL, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("gas http %d: %.120s", resp.StatusCode, string(data))
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return map[string]any{}, nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	if em, ok := out["error"].(string); ok && em != "" {
+		return nil, fmt.Errorf("gas error: %s", em)
+	}
+	return out, nil
 }
 
-// DesyncError reports the seq the server expects. For atomic datagrams
-// the writer can adopt it and resend safely.
-type DesyncError struct{ Expect int }
-
-func (e *DesyncError) Error() string {
-	return fmt.Sprintf("seq desync: server expects %d", e.Expect)
+// Push sends one opaque packet. The response is only an HTTP/application
+// status; it is not a packet acknowledgement.
+func (c *Client) Push(dir, stream string, data []byte) error {
+	return c.PushBatch(dir, stream, [][]byte{data})
 }
 
-// Push appends one chunk to the (dir, stream) queue. Returns the acked seq.
-// Retried POSTs are deduped by the server (seq <= tail -> {ok, dup}).
-func (c *Client) Push(dir, stream string, seq int, data []byte, fin bool) (int, error) {
-	enc := base64.StdEncoding.EncodeToString(data)
+// PushBatch sends several opaque packets in one GAS request. The order in
+// this slice is not a protocol guarantee; KCP supplies ordering above us.
+func (c *Client) PushBatch(dir, stream string, packets [][]byte) error {
+	encoded := make([]string, 0, len(packets))
+	for _, packet := range packets {
+		encoded = append(encoded, base64.StdEncoding.EncodeToString(packet))
+	}
+	_, err := c.call(map[string]any{
+		"op": "push", "dir": dir, "stream": stream, "packets": encoded,
+	})
+	return err
+}
+
+// Poll waits for a best-effort batch of opaque packets. The GAS side may
+// destructively remove packets before the HTTP response reaches us; that is
+// acceptable because KCP retransmits packets whose ACKs do not arrive.
+func (c *Client) Poll(dir, stream string, waitSec int) ([][]byte, error) {
 	out, err := c.call(map[string]any{
-		"op": "push", "dir": dir, "stream": stream,
-		"seq": seq, "data": enc, "fin": fin,
+		"op": "poll", "dir": dir, "stream": stream, "wait": waitSec,
 	})
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if ok, _ := out["ok"].(bool); ok {
-		return int(out["ack"].(float64)), nil
-	}
-	if expect, ok := out["expect"].(float64); ok {
-		return 0, &DesyncError{Expect: int(expect)}
-	}
-	return 0, fmt.Errorf("push rejected on %s/%s: %v", dir, stream, out)
-}
-
-// Poll long-holds (waitSec, capped server-side at 90) for new chunks after `after`.
-// Returns chunks in order and the new `after` cursor.
-func (c *Client) Poll(dir, stream string, after, waitSec int) ([]Chunk, int, error) {
-	out, err := c.call(map[string]any{
-		"op": "poll", "dir": dir, "stream": stream,
-		"after": after, "wait": waitSec,
-	})
-	if err != nil {
-		return nil, after, err
-	}
-	var chunks []Chunk
-	if arr, ok := out["chunks"].([]any); ok {
-		for _, it := range arr {
-			m, ok := it.(map[string]any)
-			if !ok {
-				continue
-			}
-			var d []byte
-			if s, ok := m["data"].(string); ok && s != "" {
-				d, _ = base64.StdEncoding.DecodeString(s)
-			}
-			fin, _ := m["fin"].(bool)
-			chunks = append(chunks, Chunk{
-				Seq:  int(m["seq"].(float64)),
-				Data: d,
-				Fin:  fin,
-			})
+	arr, _ := out["packets"].([]any)
+	packets := make([][]byte, 0, len(arr))
+	for _, item := range arr {
+		s, ok := item.(string)
+		if !ok || s == "" {
+			continue
 		}
+		packet, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			continue
+		}
+		packets = append(packets, packet)
 	}
-	next := after
-	if n, ok := out["next"].(float64); ok {
-		next = int(n)
-	}
-	return chunks, next, nil
+	return packets, nil
 }

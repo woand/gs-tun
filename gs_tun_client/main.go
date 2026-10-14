@@ -1,8 +1,8 @@
 // gs_tun_client: local side. Accepts TCP (socks5 proxy) and tunnels it over
 // a KCP session whose datagrams ride the GAS doPost bus (no UDP sockets).
 //
-// ./gs_tun_client --gs https://script.google.com/macros/s/.../exec \
-//   --token <TOKEN> --sv <SERVER_ID> -l 127.0.0.1:18080
+//	./gs_tun_client --gs https://script.google.com/macros/s/.../exec \
+//	  --token <TOKEN> --sv <SERVER_ID> -l 127.0.0.1:18080
 package main
 
 import (
@@ -29,8 +29,8 @@ func main() {
 	mtu := flag.Int("mtu", 1350, "MTU for KCP datagrams")
 	sndwnd := flag.Int("sndwnd", 128, "send window (packets)")
 	rcvwnd := flag.Int("rcvwnd", 512, "receive window (packets)")
-	ds := flag.Int("ds", 10, "FEC datashard")
-	ps := flag.Int("ps", 3, "FEC parityshard")
+	ds := flag.Int("ds", 0, "FEC datashard (0 disables FEC for the reliable GAS/KCP path)")
+	ps := flag.Int("ps", 0, "FEC parityshard (0 disables FEC for the reliable GAS/KCP path)")
 	dscp := flag.Int("dscp", 0, "DSCP value")
 	nocomp := flag.Bool("nocomp", false, "disable compression")
 	sockbuf := flag.Int("sockbuf", 4*1024*1024, "per-session buffer in bytes")
@@ -97,10 +97,6 @@ func main() {
 	}()
 
 	dialKCP := func(block kcp.BlockCrypt) (*kcp.UDPSession, error) {
-		gp, err := gaspacket.Dial(gc, "up", "down")
-		if err != nil {
-			return nil, err
-		}
 		runID := gaspacket.NewRunID()
 		ann.SetRunID(runID)
 		for {
@@ -111,7 +107,13 @@ func main() {
 			time.Sleep(2 * time.Second)
 		}
 		log.Println("announced run", runID)
-		time.Sleep(time.Second) // let the server build its listener
+		runGC := gasclient.New(*gsURL, *token,
+			gaspacket.SessForRun(*token, *sv, runID))
+		gp, err := gaspacket.Dial(runGC, "up", "down")
+		if err != nil {
+			return nil, err
+		}
+		time.Sleep(250 * time.Millisecond) // let the server build its listener
 		if err := ann.Announce(); err != nil {
 			log.Println("re-announce failed:", err)
 		}

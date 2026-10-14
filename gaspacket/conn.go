@@ -1,19 +1,14 @@
-// Package gaspacket implements net.PacketConn over the GAS doPost bus,
-// so kcp-go sessions (client NewConn / server ServeConn) can run without
-// any UDP or unix socket. One KCP datagram == one bus chunk, preserving
-// packet boundaries exactly like a datagram socket.
-//
-// Only ONE KCP client session per bus (token) is supported: the bus-level
-// sequence numbers assume a single ordered writer per direction.
+// Package gaspacket implements net.PacketConn over the lossy GAS mailbox.
+// Each item is one opaque KCP datagram. GAS may lose, duplicate, or reorder
+// items; KCP owns reliability and ordering.
 package gaspacket
 
 import (
-	"os"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,27 +16,36 @@ import (
 	"gscript-tunnel/gasclient"
 )
 
-// Stream is the bus stream carrying KCP datagrams.
+// Stream is the default KCP datagram stream. Run-specific sessions are
+// normally used so a restarted KCP conversation cannot consume stale data.
 const Stream = "dgram"
 
-// SessForToken derives the bus namespace from the token so both ends agree
-// without a --sess flag. One token == one client<->server pair.
+const (
+	txBatchMax    = 16
+	txBatchWait   = 25 * time.Millisecond
+	txPushWorkers = 4
+)
+
+// SessForToken derives the legacy bus namespace.
 func SessForToken(token string) string {
 	return SessForTokenAndServer(token, "")
 }
 
-// SessForTokenAndServer derives the bus namespace from token + server ID,
-// so one token can serve multiple gs_tun_server instances. The client
-// selects the target with --sv <server-id>. An empty serverID falls back
-// to the legacy single-server namespace.
+// SessForTokenAndServer derives a stable base namespace used for control
+// announcements. Data sessions should prefer SessForRun.
 func SessForTokenAndServer(token, serverID string) string {
 	sum := sha256.Sum256([]byte("gs-tun:" + token + ":sv:" + serverID))
 	return "g-" + hex.EncodeToString(sum[:])[:12]
 }
 
-// ServerID generates a stable server identifier from the machine's
-// characteristics (hostname) bound to the token. Same host + same token
-// always yields the same ID, so clients can rely on --sv across restarts.
+// SessForRun creates an isolated mailbox namespace for one KCP conversation.
+// This replaces the old startup tail scan now that GAS no longer has seq.
+func SessForRun(token, serverID, runID string) string {
+	sum := sha256.Sum256([]byte("gs-tun-run:" + token + ":sv:" + serverID + ":run:" + runID))
+	return "r-" + hex.EncodeToString(sum[:])[:16]
+}
+
+// ServerID generates a stable server identifier from the machine hostname.
 func ServerID(token string) string {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
@@ -56,15 +60,15 @@ type fakeAddr string
 func (a fakeAddr) Network() string { return "gas" }
 func (a fakeAddr) String() string  { return string(a) }
 
-// Conn is a virtual datagram socket over the GAS bus.
+// Conn is a virtual datagram socket over the GAS mailbox.
 type Conn struct {
 	gc       *gasclient.Client
-	pushDir  string // "up" for client, "down" for server
-	pollDir  string // "down" for client, "up" for server
-	tx       chan []byte // async sender queue; WriteTo never blocks kcp-go
-	txDrop   uint64      // datagrams dropped due to full tx queue
-	wseq     int
-	after    int
+	pushDir  string
+	pollDir  string
+	stream   string
+	tx       chan []byte
+	txDrop   uint64
+	txFail   uint64
 	rx       chan []byte
 	rmu      sync.Mutex
 	deadline time.Time
@@ -82,106 +86,109 @@ func (e timeoutError) Error() string   { return "gaspacket: i/o timeout" }
 func (e timeoutError) Timeout() bool   { return true }
 func (e timeoutError) Temporary() bool { return true }
 
-// Dial creates the virtual socket. pushDir/pollDir select the bus
-// directions: client uses ("up","down"), server uses ("down","up").
-// It learns current tails so a restart skips stale queued datagrams and
-// resumes pushing right after the last committed seq.
-func Dial(gc *gasclient.Client, pushDir, pollDir string) (*Conn, error) {
+// Dial creates a lossy virtual datagram socket. The optional stream argument
+// allows a run-specific mailbox; omitting it keeps the legacy stream name.
+func Dial(gc *gasclient.Client, pushDir, pollDir string, streams ...string) (*Conn, error) {
+	stream := Stream
+	if len(streams) > 0 && streams[0] != "" {
+		stream = streams[0]
+	}
 	c := &Conn{
 		gc:      gc,
 		pushDir: pushDir,
 		pollDir: pollDir,
+		stream:  stream,
 		tx:      make(chan []byte, 4096),
 		rx:      make(chan []byte, 2048),
 		die:     make(chan struct{}),
 		laddr:   fakeAddr("gas://local"),
 		raddr:   fakeAddr("gas://peer"),
 	}
-	// Learn tails: skip stale datagrams queued by a previous run (600s TTL).
-	if _, next, err := gc.Poll(c.pollDir, Stream, 0, 1); err == nil {
-		c.after = next
-	} else {
-		return nil, fmt.Errorf("gaspacket: learn poll tail: %w", err)
-	}
-	if _, next, err := gc.Poll(c.pushDir, Stream, 0, 1); err == nil {
-		c.wseq = next + 1
-	} else {
-		return nil, fmt.Errorf("gaspacket: learn push tail: %w", err)
-	}
 	go c.pollLoop()
 	go c.senderLoop()
 	return c, nil
 }
 
-// senderLoop pushes queued datagrams in order. kcp-go calls WriteTo
-// synchronously from its global update goroutine, so the actual HTTPS POST
-// happens here, never stalling KCP's timing. Transport errors are retried;
-// a desync adopts the server's expected seq (datagrams are atomic).
 func (c *Conn) senderLoop() {
+	workers := make(chan struct{}, txPushWorkers)
 	for {
+		batch, ok := c.nextBatch()
+		if !ok {
+			return
+		}
 		select {
+		case workers <- struct{}{}:
 		case <-c.die:
 			return
-		case dgram := <-c.tx:
-			for {
-				ack, err := c.gc.Push(c.pushDir, Stream, c.wseq, dgram, false)
-				if err == nil {
-					c.wseq = ack + 1
-					break
-				}
-				var de *gasclient.DesyncError
-				if errors.As(err, &de) {
-					c.wseq = de.Expect
-					continue
-				}
-				select {
-				case <-c.die:
-					return
-				case <-time.After(2 * time.Second):
-				}
-			}
 		}
+		go func(packets [][]byte) {
+			defer func() { <-workers }()
+			// A failed push is deliberately not retried here. It is packet
+			// loss at the GAS layer; KCP will retransmit after its ACK timeout.
+			if err := c.gc.PushBatch(c.pushDir, c.stream, packets); err != nil {
+				atomic.AddUint64(&c.txFail, 1)
+			}
+		}(batch)
 	}
 }
 
-// pollLoop feeds received datagrams into rx until Close.
+func (c *Conn) nextBatch() ([][]byte, bool) {
+	var first []byte
+	select {
+	case first = <-c.tx:
+	case <-c.die:
+		return nil, false
+	}
+	batch := make([][]byte, 0, txBatchMax)
+	batch = append(batch, first)
+	timer := time.NewTimer(txBatchWait)
+	defer timer.Stop()
+	for len(batch) < txBatchMax {
+		select {
+		case packet := <-c.tx:
+			batch = append(batch, packet)
+		case <-timer.C:
+			return batch, true
+		case <-c.die:
+			return batch, true
+		}
+	}
+	return batch, true
+}
+
 func (c *Conn) pollLoop() {
-	after := c.after
 	for {
 		select {
 		case <-c.die:
 			return
 		default:
 		}
-		chunks, next, err := c.gc.Poll(c.pollDir, Stream, after, 75)
+		packets, err := c.gc.Poll(c.pollDir, c.stream, 75)
 		if err != nil {
 			select {
 			case <-c.die:
 				return
-			case <-time.After(2 * time.Second):
-				continue
+			case <-time.After(500 * time.Millisecond):
 			}
+			continue
 		}
-		after = next
-		for _, ch := range chunks {
-			if len(ch.Data) == 0 {
+		for _, packet := range packets {
+			if len(packet) == 0 {
 				continue
 			}
 			select {
-			case c.rx <- ch.Data:
+			case c.rx <- packet:
 			case <-c.die:
 				return
 			default:
-				// kcp-go's readLoop drains continuously; overflow means
-				// something is very wrong. Drop rather than deadlock.
+				// KCP will recover a dropped datagram through its own
+				// retransmission. Never block the mailbox reader.
+				atomic.AddUint64(&c.txDrop, 1)
 			}
 		}
 	}
 }
 
-// ReadFrom blocks until a datagram arrives, the read deadline fires, or
-// Close is called. The returned addr is always the constant fake peer addr
-// (kcp-go keys server sessions and validates client sources by it).
 func (c *Conn) ReadFrom(p []byte) (int, net.Addr, error) {
 	c.rmu.Lock()
 	dl := c.deadline
@@ -191,11 +198,10 @@ func (c *Conn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if !dl.IsZero() {
 		if d := time.Until(dl); d <= 0 {
 			return 0, nil, timeoutError{}
-		} else {
-			t := time.NewTimer(d)
-			defer t.Stop()
-			timer = t.C
 		}
+		t := time.NewTimer(time.Until(dl))
+		defer t.Stop()
+		timer = t.C
 	}
 	select {
 	case b := <-c.rx:
@@ -207,10 +213,8 @@ func (c *Conn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
-// WriteTo queues one datagram for the sender loop. It never blocks: kcp-go
-// invokes it synchronously from its timing-sensitive update goroutine, and
-// a slow bus must not stall KCP. A full queue drops the datagram (KCP
-// retransmits); the copy is required because kcp-go reuses the buffer.
+// WriteTo queues a datagram without blocking KCP's update loop. A full queue
+// is intentional lossy backpressure; KCP owns retransmission.
 func (c *Conn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	select {
 	case <-c.die:
@@ -230,7 +234,6 @@ func (c *Conn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 }
 
-// Close unblocks any pending ReadFrom and stops the poll loop. Idempotent.
 func (c *Conn) Close() error {
 	c.dieOnce.Do(func() { close(c.die) })
 	return nil

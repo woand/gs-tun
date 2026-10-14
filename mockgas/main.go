@@ -1,13 +1,10 @@
-// mockgas: in-memory implementation of the Code.gs protocol, for local
-// end-to-end testing of bridge/relay without deploying to Google.
+// mockgas: in-memory implementation of the lossy Code.gs mailbox protocol.
 // Usage: mockgas --listen 127.0.0.1:18099 [--token secret]
-// Then point bridge/relay --gas http://127.0.0.1:18099/exec at it.
 package main
 
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -15,27 +12,18 @@ import (
 	"time"
 )
 
-type item struct {
-	data string
-	fin  bool
-}
-
 type store struct {
-	mu    sync.Mutex
-	tails map[string]int
-	items map[string]item
+	mu     sync.Mutex
+	queues map[string][]string
 }
 
-func key(sess, dir, stream string) string      { return sess + "|" + dir + "|" + stream }
-func dkey(sess, dir, stream string, seq int) string {
-	return fmt.Sprintf("%s|%s|%s|%d", sess, dir, stream, seq)
-}
+func key(sess, dir, stream string) string { return sess + "|" + dir + "|" + stream }
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:18099", "listen addr")
 	token := flag.String("token", "", "if set, enforce token check like GAS")
 	flag.Parse()
-	st := &store{tails: map[string]int{}, items: map[string]item{}}
+	st := &store{queues: map[string][]string{}}
 
 	http.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
 		var b map[string]any
@@ -56,68 +44,62 @@ func main() {
 			write(w, map[string]any{"error": "sess/stream/dir required"})
 			return
 		}
+
 		switch b["op"] {
 		case "push":
-			seq := int(b["seq"].(float64))
+			arr, _ := b["packets"].([]any)
+			batch := make([]string, 0, len(arr))
+			for _, value := range arr {
+				if s, ok := value.(string); ok && s != "" {
+					batch = append(batch, s)
+				}
+			}
+			if len(batch) > 16 {
+				write(w, map[string]any{"error": "too many packets"})
+				return
+			}
 			st.mu.Lock()
-			tk := key(sess, dir, stream)
-			tail := st.tails[tk]
-			var out map[string]any
-			switch {
-			case seq <= 0:
-				out = map[string]any{"error": "bad seq"}
-			case seq <= tail:
-				out = map[string]any{"ok": true, "ack": seq, "dup": true}
-			case seq != tail+1:
-				out = map[string]any{"ok": false, "expect": tail + 1}
-			default:
-				data, _ := b["data"].(string)
-				fin, _ := b["fin"].(bool)
-				st.items[dkey(sess, dir, stream, seq)] = item{data, fin}
-				st.tails[tk] = seq
-				out = map[string]any{"ok": true, "ack": seq}
+			qk := key(sess, dir, stream)
+			st.queues[qk] = append(st.queues[qk], batch...)
+			if len(st.queues[qk]) > 512 {
+				st.queues[qk] = st.queues[qk][len(st.queues[qk])-512:]
 			}
 			st.mu.Unlock()
-			write(w, out)
+			write(w, map[string]any{"ok": true})
+
 		case "poll":
-			after := int(b["after"].(float64))
-			wait := b["wait"].(float64)
-			if wait < 5 {
-				wait = 5
+			wait, _ := b["wait"].(float64)
+			if wait < 1 {
+				wait = 1
 			}
 			if wait > 90 {
 				wait = 90
 			}
 			deadline := time.Now().Add(time.Duration(wait) * time.Second)
-			tk := key(sess, dir, stream)
+			qk := key(sess, dir, stream)
 			for {
 				st.mu.Lock()
-				tail := st.tails[tk]
-				var chunks []map[string]any
-				next := after
-				if tail > after {
-					to := tail
-					if to > after+16 {
-						to = after + 16
+				q := st.queues[qk]
+				var packets []string
+				if len(q) > 0 {
+					n := len(q)
+					if n > 32 {
+						n = 32
 					}
-					for s := after + 1; s <= to; s++ {
-						it := st.items[dkey(sess, dir, stream, s)]
-						chunks = append(chunks, map[string]any{
-							"seq": s, "data": it.data, "fin": it.fin,
-						})
-					}
-					next = to
+					packets = append([]string(nil), q[:n]...)
+					st.queues[qk] = q[n:]
 				}
 				st.mu.Unlock()
-				if len(chunks) > 0 || time.Now().After(deadline) {
-					if chunks == nil {
-						chunks = []map[string]any{}
+				if len(packets) > 0 || time.Now().After(deadline) {
+					if packets == nil {
+						packets = []string{}
 					}
-					write(w, map[string]any{"chunks": chunks, "next": next})
+					write(w, map[string]any{"packets": packets})
 					return
 				}
-				time.Sleep(200 * time.Millisecond)
+				time.Sleep(20 * time.Millisecond)
 			}
+
 		default:
 			write(w, map[string]any{"error": "unknown op"})
 		}
