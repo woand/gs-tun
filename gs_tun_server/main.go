@@ -49,7 +49,7 @@ func main() {
 	logFile := flag.String("log", "", "log file, default stderr")
 	quiet := flag.Bool("quiet", false, "suppress stream open/close messages")
 	cfgFile := flag.String("c", "", "JSON config file (overrides flags)")
-	tfo := flag.Bool("tfo", true, "enable TCP fast open")
+	tfo := flag.Bool("tfo", false, "enable TCP fast open (default off: TFO blackholes on some paths)")
 	snmplog := flag.String("snmplog", "", "snmp log file pattern")
 	snmpperiod := flag.Int("snmpperiod", 60, "snmp collect period in seconds")
 	pprof := flag.Bool("pprof", false, "pprof on :6060")
