@@ -68,9 +68,11 @@ func handleSocks(p1 net.Conn, sess *smux.Session, quiet bool, buffersize int) {
 	p2.Write(b[0:n])
 
 	var b2 [10]byte
-	n2, err := p2.Read(b2[:10])
-	if n2 < 10 {
-		Vlogln(quiet, "Dial err replay:", backend, n2)
+	// NOTE: single Read may return <10 bytes on a slow/fragmented stream;
+	// ReadFull waits for the complete SOCKS5 reply.
+	n2, err := io.ReadFull(p2, b2[:])
+	if err != nil {
+		Vlogln(quiet, "Dial err replay:", backend, n2, err)
 		replyAndClose(p1, 0x03)
 		return
 	}
@@ -128,9 +130,9 @@ func handleHttp(client net.Conn, sess *smux.Session, quiet bool, buffersize int)
 	p2.Write(target)
 
 	var b2 [10]byte
-	n2, err := p2.Read(b2[:10])
-	if n2 < 10 {
-		Vlogln(quiet, "Dial err replay:", address, n2)
+	n2, err := io.ReadFull(p2, b2[:])
+	if err != nil {
+		Vlogln(quiet, "Dial err replay:", address, n2, err)
 		return
 	}
 	if err != nil || b2[1] != 0x00 {
