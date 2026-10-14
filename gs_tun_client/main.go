@@ -2,7 +2,7 @@
 // a KCP session whose datagrams ride the GAS doPost bus (no UDP sockets).
 //
 // ./gs_tun_client --gs https://script.google.com/macros/s/.../exec \
-//   --token <TOKEN> -l 127.0.0.1:18080 --key <KCPKEY>
+//   --token <TOKEN> -l 127.0.0.1:18080
 package main
 
 import (
@@ -24,8 +24,6 @@ func main() {
 	gsURL := flag.String("gs", "", "GAS /exec URL (required)")
 	token := flag.String("token", "", "bus auth token (required)")
 	localAddr := flag.String("l", ":12948", "local TCP listen addr (socks5 proxy)")
-	key := flag.String("key", "", "pre-shared KCP key (default: $KCPTUN_KEY or \"it's a secrect\")")
-	crypt := flag.String("crypt", "aes", "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none")
 	mode := flag.String("mode", "fast", "fast3, fast2, fast, normal, manual")
 	mtu := flag.Int("mtu", 1350, "MTU for KCP datagrams")
 	sndwnd := flag.Int("sndwnd", 128, "send window (packets)")
@@ -55,15 +53,11 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if *key == "" {
-		*key = os.Getenv("KCPTUN_KEY")
-	}
-	if *key == "" {
-		*key = "it's a secrect"
-	}
 
+	// No KCP-layer encryption: the bus already rides HTTPS (TLS) and is
+	// token-authenticated, so a separate pre-shared key adds nothing.
 	cfg := &kcpclient.Config{
-		LocalAddr: *localAddr, Key: *key, Crypt: *crypt, Mode: *mode,
+		LocalAddr: *localAddr, Crypt: "none", Mode: *mode,
 		MTU: *mtu, SndWnd: *sndwnd, RcvWnd: *rcvwnd,
 		DataShard: *ds, ParityShard: *ps, DSCP: *dscp, NoComp: *nocomp,
 		SockBuf: *sockbuf, StreamBuf: *streambuf, StreamBufEn: *streambufEn,
@@ -129,8 +123,8 @@ func main() {
 		return ksess, nil
 	}
 
-	fmt.Printf("server command:\n  ./gs_tun_server --gs %s --token <TOKEN> --key <KCPKEY>\n", *gsURL)
-	fmt.Printf("(same --token/--key as here; sess is derived from the token automatically)\n\n")
+	fmt.Printf("server command:\n  ./gs_tun_server --gs %s --token <TOKEN>\n", *gsURL)
+	fmt.Printf("(same --token as here; sess is derived from the token automatically)\n\n")
 
 	if err := kcpclient.Run(cfg, dialKCP); err != nil {
 		log.Fatalln(err)

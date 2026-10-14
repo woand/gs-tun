@@ -64,18 +64,18 @@ KCP 会话跑在**虚拟 PacketConn** 上——**零 UDP socket、零 unix socke
 ```bash
 # VPS/目标侧（只需出站 https，无需开端口）
 ./gs_tun_server --gs https://script.google.com/macros/s/.../exec \
-    --token <TOKEN> --key <KCPKEY>
+    --token <TOKEN>
 
 # 本地（-l 就是 socks5 监听地址）
 ./gs_tun_client --gs https://script.google.com/macros/s/.../exec \
-    --token <TOKEN> --key <KCPKEY> -l 127.0.0.1:18080
+    --token <TOKEN> -l 127.0.0.1:18080
 
 # 应用
 curl -x socks5://127.0.0.1:18080 https://example.com
 ```
 
 两个 secret 分工：`--token` 是 GAS 总线鉴权（防别人蹭你的 URL），
-`--key` 是 KCP 端到端加密（GAS 全程只看到 AES 密文）。都用强随机。
+`--token` 既是 GAS 总线鉴权也是唯一的密钥：传输层是 HTTPS（TLS），总线按 token 隔离，无 token 者无法使用你的 gs URL，所以不需要单独的 KCP 密钥。
 client 启动会打印配对好的 server 命令行。
 
 本地联调（不用部署 GAS）：`./test-kcp.sh`（mockgas + 5MB 往返 + 并发 + 重启恢复）。
@@ -110,4 +110,4 @@ client 启动会打印配对好的 server 命令行。
 - 一个 token 只支持一对 client/server（bus 层 seq 是单 writer 假设）。
 - PoC 质量：没有 metrics，日志简陋；`--conn` 写死 1。
 - `Code.gs` 未经真实 script.google.com 部署验证（mockgas 只覆盖了协议逻辑）；
-  部署后先跑 `./test-kcp.sh`（`GS_URL`/`TOKEN`/`KEY` 环境变量指向真 GAS）。
+  部署后先跑 `./test-kcp.sh`（`GS_URL`/`TOKEN` 环境变量指向真 GAS）。

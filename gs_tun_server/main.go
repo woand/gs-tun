@@ -4,7 +4,7 @@
 // socks5 proxy, this end dials whatever the client asks for.
 //
 // ./gs_tun_server --gs https://script.google.com/macros/s/.../exec \
-//   --token <TOKEN> --key <KCPKEY>
+//   --token <TOKEN>
 package main
 
 import (
@@ -26,8 +26,6 @@ func main() {
 	gsURL := flag.String("gs", "", "GAS /exec URL (required)")
 	token := flag.String("token", "", "bus auth token (required)")
 	target := flag.String("t", "127.0.0.1:12948", "target addr (unused in proxy mode, kept for compat)")
-	key := flag.String("key", "", "pre-shared KCP key (default: $KCPTUN_KEY or \"it's a secrect\")")
-	crypt := flag.String("crypt", "aes", "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none")
 	mode := flag.String("mode", "fast", "fast3, fast2, fast, normal, manual")
 	mtu := flag.Int("mtu", 1350, "MTU for KCP datagrams")
 	sndwnd := flag.Int("sndwnd", 1024, "send window (packets)")
@@ -59,15 +57,11 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if *key == "" {
-		*key = os.Getenv("KCPTUN_KEY")
-	}
-	if *key == "" {
-		*key = "it's a secrect"
-	}
 
+	// No KCP-layer encryption: the bus already rides HTTPS (TLS) and is
+	// token-authenticated, so a separate pre-shared key adds nothing.
 	cfg := &kcpserver.Config{
-		Target: *target, Key: *key, Crypt: *crypt, Mode: *mode,
+		Target: *target, Crypt: "none", Mode: *mode,
 		MTU: *mtu, SndWnd: *sndwnd, RcvWnd: *rcvwnd,
 		DataShard: *ds, ParityShard: *ps, DSCP: *dscp, NoComp: *nocomp,
 		SockBuf: *sockbuf, StreamBuf: *streambuf, StreamBufEn: *streambufEn,

@@ -3,14 +3,13 @@
 #   curl -> gs_tun_client (socks5 :18080) -> KCP over GAS bus -> gs_tun_server -> http target :19999
 # Usage:
 #   ./test-kcp.sh                                        # against mockgas
-#   GS_URL='https://script.google.com/macros/s/.../exec' TOKEN=... KEY=... ./test-kcp.sh   # against real GAS
+#   GS_URL='https://script.google.com/macros/s/.../exec' TOKEN=... ./test-kcp.sh   # against real GAS
 set -u
 cd "$(dirname "$0")"
 export PATH=$HOME/workspace/tools/go/bin:$PATH
 
 GS_URL="${GS_URL:-http://127.0.0.1:18099/exec}"
 TOKEN="${TOKEN:-testtoken}"
-KEY="${KEY:-testkey}"
 
 go build -o bin/mockgas ./mockgas || exit 1
 go build -o bin/gs_tun_client ./gs_tun_client || exit 1
@@ -36,9 +35,9 @@ dd if=/dev/urandom of=/tmp/tuntest-www/payload.bin bs=1M count=5 2>/dev/null
 (cd /tmp/tuntest-www && python3 -m http.server 19999 >/tmp/test-http.log 2>&1 &)
 sleep 1
 
-./bin/gs_tun_server --gs "$GS_URL" --token "$TOKEN" --key "$KEY" >/tmp/test-server.log 2>&1 &
+./bin/gs_tun_server --gs "$GS_URL" --token "$TOKEN" >/tmp/test-server.log 2>&1 &
 sleep 2
-./bin/gs_tun_client --gs "$GS_URL" --token "$TOKEN" --key "$KEY" -l 127.0.0.1:18080 >/tmp/test-client.log 2>&1 &
+./bin/gs_tun_client --gs "$GS_URL" --token "$TOKEN" -l 127.0.0.1:18080 >/tmp/test-client.log 2>&1 &
 sleep 12  # announce + KCP/smux handshake through the bus
 
 echo "--- single 5MB download ---"
@@ -59,7 +58,7 @@ for i in 1 2 3 4; do cmp -s /tmp/tuntest-www/payload.bin /tmp/tuntest-got$i.bin 
 echo "--- client restart (new run) ---"
 for p in $(pgrep -f "gs_tun_clien[t]"); do [ "$p" != "$$" ] && kill "$p" 2>/dev/null; done
 sleep 2
-./bin/gs_tun_client --gs "$GS_URL" --token "$TOKEN" --key "$KEY" -l 127.0.0.1:18080 >/tmp/test-client2.log 2>&1 &
+./bin/gs_tun_client --gs "$GS_URL" --token "$TOKEN" -l 127.0.0.1:18080 >/tmp/test-client2.log 2>&1 &
 sleep 12
 curl -s -x socks5://127.0.0.1:18080 --max-time 90 -o /tmp/tuntest-gotR.bin http://127.0.0.1:19999/payload.bin \
   && cmp -s /tmp/tuntest-www/payload.bin /tmp/tuntest-gotR.bin && echo "PASS: restart recovery" || echo "FAIL: restart"
