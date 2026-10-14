@@ -46,6 +46,7 @@ func main() {
 	keepalivems := flag.Int("keepalivems", 10000, "milliseconds between heartbeats")
 	keepaliveTimeout := flag.Int("keepalive-timeout", 75000, "heartbeat response timeout in ms")
 	dns := flag.String("dns", "", "failback DNS, comma-separated")
+	svID := flag.String("sv-id", "", "override auto-generated server id (for a fresh bus namespace)")
 	logFile := flag.String("log", "", "log file, default stderr")
 	quiet := flag.Bool("quiet", false, "suppress stream open/close messages")
 	cfgFile := flag.String("c", "", "JSON config file (overrides flags)")
@@ -90,7 +91,11 @@ func main() {
 
 	// Multi-server: each server gets a stable ID derived from its hostname,
 	// and the bus namespace includes it, so one token can serve many servers.
+	// --sv-id overrides the auto-generated ID (e.g. to escape a polluted bus).
 	serverID := gaspacket.ServerID(*token)
+	if *svID != "" {
+		serverID = *svID
+	}
 	sess := gaspacket.SessForTokenAndServer(*token, serverID)
 	fmt.Printf("server id: %s  (clients use --sv %s)\n", serverID, serverID)
 	gc := gasclient.New(*gsURL, *token, sess)
