@@ -2,6 +2,7 @@
 package gasclient
 
 import (
+	"sync"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -24,16 +25,62 @@ type Chunk struct {
 type Client struct {
 	URL, Token, Sess string
 	HC               *http.Client
+
+	mu    sync.Mutex
+	redir string // cached GAS redirect target (/exec -> googleusercontent)
 }
 
 func New(url, token, sess string) *Client {
 	return &Client{
 		URL: url, Token: token, Sess: sess,
-		HC: &http.Client{Timeout: 150 * time.Second}, // > max long-poll hold (90s)
+		HC: &http.Client{
+			Timeout: 150 * time.Second, // > max long-poll hold (90s)
+			// Do NOT auto-follow: Go would turn the GAS 302 into a GET
+			// and drop the body. We re-POST manually below.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
+// target returns the cached redirect URL if known, else the /exec URL.
+func (c *Client) target() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.redir != "" {
+		return c.redir
+	}
+	return c.URL
+}
+
+func (c *Client) setRedir(u string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.redir = u
+}
+
+func (c *Client) doPost(url string, raw []byte) (data []byte, status int, loc string, err error) {
+	req, err := http.NewRequest("POST", url, bytes.NewReader(raw))
+	if err != nil {
+		return nil, 0, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	defer resp.Body.Close()
+	data, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	return data, resp.StatusCode, resp.Header.Get("Location"), nil
+}
+
 // call POSTs one JSON body and returns the decoded JSON response.
+// GAS /exec always 302-redirects to googleusercontent.com; the redirect
+// is followed with a repeat POST (same body) and the target is cached.
 // Retries transient transport failures. Push stays idempotent because the
 // server dedups by seq (seq <= tail -> {ok, dup}).
 func (c *Client) call(body map[string]any) (map[string]any, error) {
@@ -45,27 +92,28 @@ func (c *Client) call(body map[string]any) (map[string]any, error) {
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt) * time.Second)
 		}
-		req, err := http.NewRequest("POST", c.URL, bytes.NewReader(raw))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := c.HC.Do(req)
+		data, status, loc, err := c.doPost(c.target(), raw)
 		if err != nil {
 			last = err
 			continue
 		}
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			last = err
-			continue
+		if status == 301 || status == 302 || status == 303 {
+			if loc == "" {
+				last = fmt.Errorf("gas redirect without location")
+				continue
+			}
+			c.setRedir(loc)
+			data, status, _, err = c.doPost(loc, raw)
+			if err != nil {
+				last = err
+				continue
+			}
 		}
-		if resp.StatusCode == 403 {
+		if status == 403 {
 			return nil, fmt.Errorf("auth rejected (bad token?)")
 		}
-		if resp.StatusCode/100 != 2 {
-			last = fmt.Errorf("gas http %d", resp.StatusCode)
+		if status/100 != 2 {
+			last = fmt.Errorf("gas http %d", status)
 			continue
 		}
 		var out map[string]any
