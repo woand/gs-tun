@@ -13,18 +13,15 @@
 //
 // CacheService is only a temporary mailbox. A poll destructively removes a
 // batch before returning it. If the HTTP response is lost, KCP will resend
-// packets whose own ACKs do not arrive. The queue index below is an internal
+// packets whose own ACKs do not arrive. The mailbox key is an internal
 // CacheService implementation detail; it is not a wire-level FIFO/sequence.
 
 var CHUNK_TTL = 600;             // seconds
 var MAX_WAIT = 90;               // below the Apps Script execution limit
 var MAX_PUSH_PACKETS = 16;       // keep one request comfortably small
 var MAX_POLL_PACKETS = 32;
-var MAX_QUEUE_PACKETS = 512;     // lossy backpressure: discard oldest entries
-// LockService is global to this script. Never let one contending mailbox
-// request park for 15 seconds: KCP above this bus already handles loss and
-// retransmission. A short lock attempt turns contention into a cheap retry.
-var LOCK_TRY_MS = 250;
+// The mailbox is deliberately lossy: a newer batch may replace an older one
+// before it is polled. KCP above this bus owns ordering and retransmission.
 var POLL_SLEEP_MIN_MS = 50;
 var POLL_SLEEP_MAX_MS = 250;
 
@@ -40,10 +37,6 @@ function j_(o) {
 
 function qkey_(sess, dir, stream) {
   return 'q:' + sess + ':' + dir + ':' + stream;
-}
-
-function itemKey_(sess, dir, stream) {
-  return 'p:' + sess + ':' + dir + ':' + stream + ':' + Utilities.getUuid();
 }
 
 function doPost(e) {
@@ -62,8 +55,9 @@ function doPost(e) {
   }
 }
 
-// Append opaque packets to a short-lived mailbox. There is no packet seq,
-// ACK, retry, or duplicate suppression here.
+// Publish the newest opaque batch to a short-lived mailbox. There is no
+// packet seq, ACK, retry, duplicate suppression, FIFO, or script lock here.
+// A concurrent push may overwrite this batch; KCP retransmits what it needs.
 function push_(b) {
   var packets = b.packets;
   if (!Array.isArray(packets)) return j_({error: 'packets required'});
@@ -73,91 +67,36 @@ function push_(b) {
   }
 
   var cache = CacheService.getScriptCache();
-  var keys = [];
-  var values = {};
+  var batch = [];
   for (var i = 0; i < packets.length; i++) {
-    if (typeof packets[i] !== 'string' || packets[i].length === 0) continue;
-    var key = itemKey_(b.sess, b.dir, b.stream);
-    keys.push(key);
-    values[key] = packets[i];
-  }
-  if (keys.length === 0) return j_({ok: true});
-
-  // Put packet values before publishing their keys. If CacheService evicts a
-  // value, the poller simply drops that packet and KCP retransmits it.
-  cache.putAll(values, CHUNK_TTL);
-
-  var lock = LockService.getScriptLock();
-  if (!lock.tryLock(LOCK_TRY_MS)) {
-    // gasclient treats an HTTP/application error as packet loss; KCP will
-    // retransmit the datagram instead of allowing this request to stall.
-    return j_({error: 'busy'});
-  }
-  try {
-    var qkey = qkey_(b.sess, b.dir, b.stream);
-    var queue = [];
-    var raw = cache.get(qkey);
-    if (raw) {
-      try { queue = JSON.parse(raw); } catch (ignore) { queue = []; }
-      if (!Array.isArray(queue)) queue = [];
+    if (typeof packets[i] === 'string' && packets[i].length > 0) {
+      batch.push(packets[i]);
     }
-    queue = queue.concat(keys);
-    var discarded = [];
-    if (queue.length > MAX_QUEUE_PACKETS) {
-      discarded = queue.slice(0, queue.length - MAX_QUEUE_PACKETS);
-      queue = queue.slice(queue.length - MAX_QUEUE_PACKETS);
-    }
-    cache.put(qkey, JSON.stringify(queue), CHUNK_TTL);
-    if (discarded.length > 0) cache.removeAll(discarded);
-    return j_({ok: true});
-  } finally {
-    lock.releaseLock();
   }
+  if (batch.length === 0) return j_({ok: true});
+
+  // One CacheService write replaces the previous batch. This avoids the
+  // global ScriptLock and the queue-index read/modify/write round trip.
+  cache.put(qkey_(b.sess, b.dir, b.stream), JSON.stringify(batch), CHUNK_TTL);
+  return j_({ok: true});
 }
 
-// Atomically reserves and removes a batch from the mailbox index, then reads
-// and deletes the packet values. The operation is intentionally destructive.
+// Read and remove the newest mailbox batch. The get/remove race is
+// intentionally lossy: if a push overlaps this operation, either batch may
+// be dropped and KCP will retransmit missing data.
 function pop_(b, maxPackets) {
   var cache = CacheService.getScriptCache();
   var qkey = qkey_(b.sess, b.dir, b.stream);
-
-  // The overwhelmingly common long-poll path is an empty queue. Avoid
-  // taking the global script lock just to discover that there is no data.
-  // Re-read the queue after acquiring the lock to close the push/pop race.
-  var preview = cache.get(qkey);
-  if (!preview) return [];
+  var raw = cache.get(qkey);
+  if (!raw) return [];
+  cache.remove(qkey);
   try {
-    var previewQueue = JSON.parse(preview);
-    if (!Array.isArray(previewQueue) || previewQueue.length === 0) return [];
-  } catch (ignorePreview) {
+    var packets = JSON.parse(raw);
+    if (!Array.isArray(packets)) return [];
+    return packets.slice(0, maxPackets);
+  } catch (ignore) {
     return [];
   }
-
-  var lock = LockService.getScriptLock();
-  if (!lock.tryLock(LOCK_TRY_MS)) return null;
-  var keys;
-  try {
-    var queue = [];
-    var raw = cache.get(qkey);
-    if (raw) {
-      try { queue = JSON.parse(raw); } catch (ignore) { queue = []; }
-      if (!Array.isArray(queue)) queue = [];
-    }
-    if (queue.length === 0) return [];
-    keys = queue.splice(0, maxPackets);
-    cache.put(qkey, JSON.stringify(queue), CHUNK_TTL);
-  } finally {
-    lock.releaseLock();
-  }
-
-  var values = cache.getAll(keys);
-  var packets = [];
-  for (var i = 0; i < keys.length; i++) {
-    var value = values[keys[i]];
-    if (value !== undefined && value !== null && value !== '') packets.push(value);
-  }
-  cache.removeAll(keys);
-  return packets;
 }
 
 function poll_(b) {
@@ -166,13 +105,6 @@ function poll_(b) {
   var sleepMs = POLL_SLEEP_MIN_MS;
   while (true) {
     var packets = pop_(b, MAX_POLL_PACKETS);
-    if (packets === null) {
-      // Another push/pop briefly owns the script lock. Retry inside this
-      // execution without exposing a 15-second LockService stall.
-      if (Date.now() >= deadline) return j_({packets: []});
-      Utilities.sleep(POLL_SLEEP_MIN_MS);
-      continue;
-    }
     if (packets.length > 0) return j_({packets: packets});
     if (Date.now() >= deadline) return j_({packets: []});
     Utilities.sleep(sleepMs);
