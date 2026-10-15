@@ -18,9 +18,9 @@ import (
 
 	"path/filepath"
 
+	"github.com/cs8425/smux"
 	"github.com/golang/snappy"
 	kcp "github.com/xtaci/kcp-go"
-	"github.com/cs8425/smux"
 )
 
 var (
@@ -79,7 +79,6 @@ func handleMux(conn io.ReadWriteCloser, config *Config) {
 	smuxConfig.EnableStreamBuffer = config.StreamBufEn
 	smuxConfig.BoostTimeout = time.Duration(config.BoostTimeout) * time.Millisecond
 
-
 	mux, err := smux.Server(conn, smuxConfig)
 	if err != nil {
 		log.Println(err)
@@ -106,147 +105,150 @@ func Run(config *Config, listenKCP func(block kcp.BlockCrypt) (lis *kcp.Listener
 	if VERSION == "SELFBUILD" {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
-		// log redirect
-		if config.Log != "" {
-			f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			log.SetOutput(f)
-		}
-
-		switch config.Mode {
-		case "normal":
-			config.NoDelay, config.Interval, config.Resend, config.NoCongestion = 0, 40, 2, 1
-		case "fast":
-			config.NoDelay, config.Interval, config.Resend, config.NoCongestion = 0, 30, 2, 1
-		case "fast2":
-			config.NoDelay, config.Interval, config.Resend, config.NoCongestion = 1, 20, 2, 1
-		case "fast3":
-			config.NoDelay, config.Interval, config.Resend, config.NoCongestion = 1, 10, 2, 1
-		}
-
-		log.Println("version:", VERSION)
-		log.Println("initiating key derivation")
-		pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 4096, 32, sha1.New)
-		var block kcp.BlockCrypt
-		switch config.Crypt {
-		case "sm4":
-			block, _ = kcp.NewSM4BlockCrypt(pass[:16])
-		case "tea":
-			block, _ = kcp.NewTEABlockCrypt(pass[:16])
-		case "xor":
-			block, _ = kcp.NewSimpleXORBlockCrypt(pass)
-		case "none":
-			block, _ = kcp.NewNoneBlockCrypt(pass)
-		case "aes-128":
-			block, _ = kcp.NewAESBlockCrypt(pass[:16])
-		case "aes-192":
-			block, _ = kcp.NewAESBlockCrypt(pass[:24])
-		case "blowfish":
-			block, _ = kcp.NewBlowfishBlockCrypt(pass)
-		case "twofish":
-			block, _ = kcp.NewTwofishBlockCrypt(pass)
-		case "cast5":
-			block, _ = kcp.NewCast5BlockCrypt(pass[:16])
-		case "3des":
-			block, _ = kcp.NewTripleDESBlockCrypt(pass[:24])
-		case "xtea":
-			block, _ = kcp.NewXTEABlockCrypt(pass[:16])
-		case "salsa20":
-			block, _ = kcp.NewSalsa20BlockCrypt(pass)
-		default:
-			config.Crypt = "aes"
-			block, _ = kcp.NewAESBlockCrypt(pass)
-		}
-
-		if config.KeepAliveMS == 0 {
-			config.KeepAliveMS = config.KeepAlive * 1000
-		}
-
-		lis, cleanup, err := listenKCP(block)
+	// log redirect
+	if config.Log != "" {
+		f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
 			return err
 		}
-		defer cleanup()
-		go func() {
-			<-stop
-			lis.Close() // unblocks AcceptKCP; also closes the bus conn
-		}()
-		log.Println("listening on:", lis.Addr())
-		log.Println("target:", config.Target)
-		log.Println("encryption:", config.Crypt)
-		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
-		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
-		log.Println("compression:", !config.NoComp)
-		log.Println("mtu:", config.MTU)
-		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
-		log.Println("acknodelay:", config.AckNodelay)
-		log.Println("dscp:", config.DSCP)
-		log.Println("sockbuf:", config.SockBuf)
-		log.Println("snmplog:", config.SnmpLog)
-		log.Println("snmpperiod:", config.SnmpPeriod)
-		log.Println("pprof:", config.Pprof)
-		log.Println("quiet:", config.Quiet)
+		defer f.Close()
+		log.SetOutput(f)
+	}
 
-		log.Println("keepaliveMS:", config.KeepAliveMS)
-		log.Println("keepalive-timeout:", config.KeepAliveTimeout)
-		log.Println("sockbuf:", config.SockBuf)
-		log.Println("streambuf-en:", config.StreamBufEn)
-		log.Println("streambuf:", config.StreamBuf)
-		log.Println("boosttimeout:", config.BoostTimeout)
-		log.Println("maxframe:", config.MaxFrameSize)
-		log.Println("pipebuf:", config.PipeBuf)
+	switch config.Mode {
+	case "normal":
+		config.NoDelay, config.Interval, config.Resend, config.NoCongestion = 0, 40, 2, 1
+	case "fast":
+		config.NoDelay, config.Interval, config.Resend, config.NoCongestion = 0, 30, 2, 1
+	case "fast2":
+		config.NoDelay, config.Interval, config.Resend, config.NoCongestion = 1, 20, 2, 1
+	case "fast3":
+		config.NoDelay, config.Interval, config.Resend, config.NoCongestion = 1, 10, 2, 1
+	}
 
-		log.Println("service:", config.Service)
-		log.Println("TCP Fast Open(tfo):", config.TFO)
+	log.Println("version:", VERSION)
+	log.Println("initiating key derivation")
+	pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 4096, 32, sha1.New)
+	var block kcp.BlockCrypt
+	switch config.Crypt {
+	case "sm4":
+		block, _ = kcp.NewSM4BlockCrypt(pass[:16])
+	case "tea":
+		block, _ = kcp.NewTEABlockCrypt(pass[:16])
+	case "xor":
+		block, _ = kcp.NewSimpleXORBlockCrypt(pass)
+	case "none":
+		block, _ = kcp.NewNoneBlockCrypt(pass)
+	case "aes-128":
+		block, _ = kcp.NewAESBlockCrypt(pass[:16])
+	case "aes-192":
+		block, _ = kcp.NewAESBlockCrypt(pass[:24])
+	case "blowfish":
+		block, _ = kcp.NewBlowfishBlockCrypt(pass)
+	case "twofish":
+		block, _ = kcp.NewTwofishBlockCrypt(pass)
+	case "cast5":
+		block, _ = kcp.NewCast5BlockCrypt(pass[:16])
+	case "3des":
+		block, _ = kcp.NewTripleDESBlockCrypt(pass[:24])
+	case "xtea":
+		block, _ = kcp.NewXTEABlockCrypt(pass[:16])
+	case "salsa20":
+		block, _ = kcp.NewSalsa20BlockCrypt(pass)
+	default:
+		config.Crypt = "aes"
+		block, _ = kcp.NewAESBlockCrypt(pass)
+	}
 
-		if len(config.DNS) > 0 {
-			log.Println("failback-DNS:", config.DNS)
-			setDefaultNS(config.DNS)
-		}
+	if config.KeepAliveMS == 0 {
+		config.KeepAliveMS = config.KeepAlive * 1000
+	}
 
-		if err := lis.SetDSCP(config.DSCP); err != nil {
-			log.Println("SetDSCP:", err)
-		}
-		if err := lis.SetReadBuffer(config.SockBuf); err != nil {
-			log.Println("SetReadBuffer:", err)
-		}
-		if err := lis.SetWriteBuffer(config.SockBuf); err != nil {
-			log.Println("SetWriteBuffer:", err)
-		}
+	lis, cleanup, err := listenKCP(block)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	go func() {
+		<-stop
+		lis.Close() // unblocks AcceptKCP; also closes the bus conn
+	}()
+	log.Println("listening on:", lis.Addr())
+	log.Println("target:", config.Target)
+	log.Println("encryption:", config.Crypt)
+	log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
+	log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
+	log.Println("compression:", !config.NoComp)
+	log.Println("mtu:", config.MTU)
+	log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
+	log.Println("acknodelay:", config.AckNodelay)
+	log.Println("dscp:", config.DSCP)
+	log.Println("sockbuf:", config.SockBuf)
+	log.Println("snmplog:", config.SnmpLog)
+	log.Println("snmpperiod:", config.SnmpPeriod)
+	log.Println("pprof:", config.Pprof)
+	log.Println("quiet:", config.Quiet)
 
-		go snmpLogger(config.SnmpLog, config.SnmpPeriod)
-		if config.Pprof {
-			go http.ListenAndServe(":6060", nil)
-		}
+	log.Println("keepaliveMS:", config.KeepAliveMS)
+	log.Println("keepalive-timeout:", config.KeepAliveTimeout)
+	log.Println("sockbuf:", config.SockBuf)
+	log.Println("streambuf-en:", config.StreamBufEn)
+	log.Println("streambuf:", config.StreamBuf)
+	log.Println("boosttimeout:", config.BoostTimeout)
+	log.Println("maxframe:", config.MaxFrameSize)
+	log.Println("pipebuf:", config.PipeBuf)
 
-		for {
-			if conn, err := lis.AcceptKCP(); err == nil {
-				log.Println("remote address:", conn.RemoteAddr())
-				conn.SetStreamMode(true)
-				conn.SetWriteDelay(false)
-				conn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
-				conn.SetMtu(config.MTU)
-				conn.SetWindowSize(config.SndWnd, config.RcvWnd)
-				conn.SetACKNoDelay(config.AckNodelay)
+	log.Println("service:", config.Service)
+	log.Println("TCP Fast Open(tfo):", config.TFO)
 
-				if config.NoComp {
-					go handleMux(conn, config)
-				} else {
-					go handleMux(newCompStream(conn), config)
-				}
+	if len(config.DNS) > 0 {
+		log.Println("failback-DNS:", config.DNS)
+		setDefaultNS(config.DNS)
+	}
+
+	if err := lis.SetDSCP(config.DSCP); err != nil {
+		log.Println("SetDSCP:", err)
+	}
+	if err := lis.SetReadBuffer(config.SockBuf); err != nil {
+		log.Println("SetReadBuffer:", err)
+	}
+	if err := lis.SetWriteBuffer(config.SockBuf); err != nil {
+		log.Println("SetWriteBuffer:", err)
+	}
+
+	go snmpLogger(config.SnmpLog, config.SnmpPeriod)
+	if config.Pprof {
+		go http.ListenAndServe(":6060", nil)
+	}
+
+	for {
+		if conn, err := lis.AcceptKCP(); err == nil {
+			log.Println("remote address:", conn.RemoteAddr())
+			conn.SetStreamMode(true)
+			conn.SetWriteDelay(false)
+			conn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
+			if config.InitialRTO > 0 {
+				conn.SetInitialRTO(config.InitialRTO)
+			}
+			conn.SetMtu(config.MTU)
+			conn.SetWindowSize(config.SndWnd, config.RcvWnd)
+			conn.SetACKNoDelay(config.AckNodelay)
+
+			if config.NoComp {
+				go handleMux(conn, config)
 			} else {
-				select {
-				case <-stop:
-					return nil
-				default:
-					log.Printf("%+v", err)
-					time.Sleep(time.Second)
-				}
+				go handleMux(newCompStream(conn), config)
+			}
+		} else {
+			select {
+			case <-stop:
+				return nil
+			default:
+				log.Printf("%+v", err)
+				time.Sleep(time.Second)
 			}
 		}
+	}
 }
 
 func snmpLogger(path string, interval int) {

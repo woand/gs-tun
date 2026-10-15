@@ -24,6 +24,7 @@ type Config struct {
 	Interval     int    `json:"interval"`
 	Resend       int    `json:"resend"`
 	NoCongestion int    `json:"nc"`
+	InitialRTO   int    `json:"initialrto"`
 	Log          string `json:"log"`
 	SnmpLog      string `json:"snmplog"`
 	SnmpPeriod   int    `json:"snmpperiod"`
@@ -31,20 +32,20 @@ type Config struct {
 	Quiet        bool   `json:"quiet"`
 
 	// smux setting
-	KeepAlive         int    `json:"keepalive"`
-	KeepAliveMS       int    `json:"keepalivems"`
-	KeepAliveTimeout  int    `json:"keepalive-timeout"`
-	SockBuf           int    `json:"sockbuf"`
-	StreamBuf         int    `json:"streambuf"`
-	StreamBufEn       bool   `json:"streambuf-en"`
-	BoostTimeout      int    `json:"boosttimeout"`
-	MaxFrameSize      int    `json:"maxframe"`
-	PipeBuf           int    `json:"pipebuf"`
+	KeepAlive        int  `json:"keepalive"`
+	KeepAliveMS      int  `json:"keepalivems"`
+	KeepAliveTimeout int  `json:"keepalive-timeout"`
+	SockBuf          int  `json:"sockbuf"`
+	StreamBuf        int  `json:"streambuf"`
+	StreamBufEn      bool `json:"streambuf-en"`
+	BoostTimeout     int  `json:"boosttimeout"`
+	MaxFrameSize     int  `json:"maxframe"`
+	PipeBuf          int  `json:"pipebuf"`
 
 	// extra
-	DNS               []string `json:"dns"`
-	Service           string   `json:"ser"`
-	TFO               bool     `json:"tfo"`
+	DNS     []string `json:"dns"`
+	Service string   `json:"ser"`
+	TFO     bool     `json:"tfo"`
 }
 
 func parseJSONConfig(config *Config, path string) error {

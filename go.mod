@@ -11,6 +11,8 @@ require (
 	golang.org/x/crypto v0.0.0-20190320223903-b7391e95e576
 )
 
+replace github.com/xtaci/kcp-go => ./third_party/kcp-go
+
 require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/klauspost/cpuid v1.2.0 // indirect

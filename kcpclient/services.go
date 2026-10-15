@@ -1,13 +1,14 @@
 package kcpclient
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/url"
-	"bytes"
+	"strconv"
 	"strings"
-	"fmt"
 
 	"github.com/cs8425/smux"
 )
@@ -17,75 +18,117 @@ func replyAndClose(p1 net.Conn, rpy int) {
 	p1.Close()
 }
 
-// thanks: http://www.golangnote.com/topic/141.html
+func readSocksRequest(r io.Reader) ([]byte, string, error) {
+	var h [4]byte
+	if _, err := io.ReadFull(r, h[:]); err != nil {
+		return nil, "", err
+	}
+	if h[0] != 0x05 || h[1] != 0x01 {
+		return nil, "", fmt.Errorf("unsupported SOCKS5 request")
+	}
+	request := append([]byte(nil), h[:]...)
+	var host string
+	switch h[3] {
+	case 0x01:
+		var tail [6]byte
+		if _, err := io.ReadFull(r, tail[:]); err != nil {
+			return nil, "", err
+		}
+		request = append(request, tail[:]...)
+		host = net.IPv4(tail[0], tail[1], tail[2], tail[3]).String()
+	case 0x03:
+		var length [1]byte
+		if _, err := io.ReadFull(r, length[:]); err != nil {
+			return nil, "", err
+		}
+		body := make([]byte, int(length[0])+2)
+		if _, err := io.ReadFull(r, body); err != nil {
+			return nil, "", err
+		}
+		request = append(request, length[0])
+		request = append(request, body...)
+		host = string(body[:len(body)-2])
+	case 0x04:
+		var tail [18]byte
+		if _, err := io.ReadFull(r, tail[:]); err != nil {
+			return nil, "", err
+		}
+		request = append(request, tail[:]...)
+		host = net.IP(tail[:16]).String()
+	default:
+		return nil, "", fmt.Errorf("unsupported SOCKS5 address type %d", h[3])
+	}
+	port := int(request[len(request)-2])<<8 | int(request[len(request)-1])
+	return request, net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
+// The local SOCKS reply is optimistic: application bytes can be pipelined
+// while the remote side is still dialing. The remote SOCKS reply is consumed
+// on the smux stream and never exposed to the local client.
 func handleSocks(p1 net.Conn, sess *smux.Session, quiet bool, buffersize int) {
-	var b [320]byte
-	n, err := p1.Read(b[:])
-	if err != nil {
+	var greeting [2]byte
+	if _, err := io.ReadFull(p1, greeting[:]); err != nil {
 		Vlogln(quiet, "socks client read", p1, err)
 		return
 	}
-	if b[0] != 0x05 { //only Socket5
+	if greeting[0] != 0x05 {
 		return
 	}
-
-	//reply: NO AUTHENTICATION REQUIRED
+	methods := make([]byte, int(greeting[1]))
+	if _, err := io.ReadFull(p1, methods); err != nil {
+		return
+	}
+	if !bytes.Contains(methods, []byte{0x00}) {
+		replyAndClose(p1, 0xff)
+		return
+	}
 	p1.Write([]byte{0x05, 0x00})
 
-	n, err = p1.Read(b[:])
-	if b[1] != 0x01 { // 0x01: CONNECT
-		replyAndClose(p1, 0x07) // X'07' Command not supported
+	request, backend, err := readSocksRequest(p1)
+	if err != nil {
+		replyAndClose(p1, 0x07)
 		return
 	}
-
-	var backend string
-	switch b[3] {
-	case 0x01: //IP V4
-		backend = net.IPv4(b[4], b[5], b[6], b[7]).String()
-		if n != 10 {
-			replyAndClose(p1, 0x07) // X'07' Command not supported
-			return
-		}
-	case 0x03: //DOMAINNAME
-		backend = string(b[5 : n-2]) //b[4] domain name length
-	case 0x04: //IP V6
-		backend = net.IP{b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]}.String()
-		if n != 22 {
-			replyAndClose(p1, 0x07) // X'07' Command not supported
-			return
-		}
-	default:
-		replyAndClose(p1, 0x08) // X'08' Address type not supported
-		return
-	}
-
 	p2, err := sess.OpenStream()
 	if err != nil {
 		return
 	}
 	defer p2.Close()
-	// send to proxy
-	p2.Write(b[0:n])
-
-	var b2 [10]byte
-	// NOTE: single Read may return <10 bytes on a slow/fragmented stream;
-	// ReadFull waits for the complete SOCKS5 reply.
-	n2, err := io.ReadFull(p2, b2[:])
-	if err != nil {
-		Vlogln(quiet, "Dial err replay:", backend, n2, err)
-		replyAndClose(p1, 0x03)
+	if _, err := p2.Write(request); err != nil {
 		return
 	}
-	if err != nil || b2[1] != 0x00 {
-		Vlogln(quiet, "socks err to:", backend, n2, b2[1], err)
-		replyAndClose(p1, int(b2[1]))
+
+	if _, err := p1.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); err != nil {
+		return
+	}
+	remoteReady := make(chan error, 1)
+	go func() {
+		var remoteReply [10]byte
+		_, err := io.ReadFull(p2, remoteReply[:])
+		if err == nil && remoteReply[1] != 0x00 {
+			err = fmt.Errorf("remote SOCKS reply %d", remoteReply[1])
+		}
+		remoteReady <- err
+	}()
+	clientDone := make(chan struct{})
+	go func() { io.CopyBuffer(p2, p1, make([]byte, buffersize)); close(clientDone) }()
+	select {
+	case err := <-remoteReady:
+		if err != nil {
+			Vlogln(quiet, "Dial err:", backend, err)
+			return
+		}
+	case <-clientDone:
 		return
 	}
 
 	Vlogln(quiet, "socks to:", backend)
-	reply := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	p1.Write(reply) // reply OK
-	cp(p1, p2, buffersize)
+	remoteDone := make(chan struct{})
+	go func() { io.CopyBuffer(p1, p2, make([]byte, buffersize)); close(remoteDone) }()
+	select {
+	case <-clientDone:
+	case <-remoteDone:
+	}
 }
 
 // thanks: http://www.golangnote.com/topic/141.html
@@ -117,7 +160,6 @@ func handleHttp(client net.Conn, sess *smux.Session, quiet bool, buffersize int)
 	} else {
 		address = hostPortURL.Host
 	}
-
 
 	p2, err := sess.OpenStream()
 	if err != nil {
@@ -198,4 +240,3 @@ func Vlogln(quiet bool, v ...interface{}) {
 		log.Println(v...)
 	}
 }
-

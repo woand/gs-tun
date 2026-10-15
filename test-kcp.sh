@@ -35,9 +35,9 @@ dd if=/dev/urandom of=/tmp/tuntest-www/payload.bin bs=1M count=5 2>/dev/null
 (cd /tmp/tuntest-www && python3 -m http.server 19999 >/tmp/test-http.log 2>&1 &)
 sleep 1
 
-./bin/gs_tun_server --gs "$GS_URL" --token "$TOKEN" >/tmp/test-server.log 2>&1 &
+./bin/gs_tun_server --gs "$GS_URL" --token "$TOKEN" --sv-id test-server >/tmp/test-server.log 2>&1 &
 sleep 2
-./bin/gs_tun_client --gs "$GS_URL" --token "$TOKEN" -l 127.0.0.1:18080 >/tmp/test-client.log 2>&1 &
+./bin/gs_tun_client --gs "$GS_URL" --token "$TOKEN" --sv test-server -l 127.0.0.1:18080 >/tmp/test-client.log 2>&1 &
 sleep 12  # announce + KCP/smux handshake through the bus
 
 echo "--- single 5MB download ---"
@@ -58,7 +58,7 @@ for i in 1 2 3 4; do cmp -s /tmp/tuntest-www/payload.bin /tmp/tuntest-got$i.bin 
 echo "--- client restart (new run) ---"
 for p in $(pgrep -f "gs_tun_clien[t]"); do [ "$p" != "$$" ] && kill "$p" 2>/dev/null; done
 sleep 2
-./bin/gs_tun_client --gs "$GS_URL" --token "$TOKEN" -l 127.0.0.1:18080 >/tmp/test-client2.log 2>&1 &
+./bin/gs_tun_client --gs "$GS_URL" --token "$TOKEN" --sv test-server -l 127.0.0.1:18080 >/tmp/test-client2.log 2>&1 &
 sleep 12
 curl -s -x socks5://127.0.0.1:18080 --max-time 90 -o /tmp/tuntest-gotR.bin http://127.0.0.1:19999/payload.bin \
   && cmp -s /tmp/tuntest-www/payload.bin /tmp/tuntest-gotR.bin && echo "PASS: restart recovery" || echo "FAIL: restart"

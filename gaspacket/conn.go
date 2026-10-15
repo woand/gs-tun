@@ -5,6 +5,7 @@ package gaspacket
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -23,7 +24,8 @@ const Stream = "dgram"
 const (
 	txBatchMax    = 16
 	txBatchWait   = 25 * time.Millisecond
-	txPushWorkers = 4
+	txPushWorkers = 1
+	kcpCmdPush    = 81
 )
 
 // SessForToken derives the legacy bus namespace.
@@ -66,7 +68,8 @@ type Conn struct {
 	pushDir  string
 	pollDir  string
 	stream   string
-	tx       chan []byte
+	txCtrl   chan []byte
+	txData   chan []byte
 	txDrop   uint64
 	txFail   uint64
 	rx       chan []byte
@@ -98,7 +101,8 @@ func Dial(gc *gasclient.Client, pushDir, pollDir string, streams ...string) (*Co
 		pushDir: pushDir,
 		pollDir: pollDir,
 		stream:  stream,
-		tx:      make(chan []byte, 4096),
+		txCtrl:  make(chan []byte, 1024),
+		txData:  make(chan []byte, 4096),
 		rx:      make(chan []byte, 2048),
 		die:     make(chan struct{}),
 		laddr:   fakeAddr("gas://local"),
@@ -134,10 +138,16 @@ func (c *Conn) senderLoop() {
 
 func (c *Conn) nextBatch() ([][]byte, bool) {
 	var first []byte
+	// Give pending ACK/window/control datagrams priority over payload.
 	select {
-	case first = <-c.tx:
-	case <-c.die:
-		return nil, false
+	case first = <-c.txCtrl:
+	default:
+		select {
+		case first = <-c.txCtrl:
+		case first = <-c.txData:
+		case <-c.die:
+			return nil, false
+		}
 	}
 	batch := make([][]byte, 0, txBatchMax)
 	batch = append(batch, first)
@@ -145,15 +155,38 @@ func (c *Conn) nextBatch() ([][]byte, bool) {
 	defer timer.Stop()
 	for len(batch) < txBatchMax {
 		select {
-		case packet := <-c.tx:
+		case packet := <-c.txCtrl:
 			batch = append(batch, packet)
-		case <-timer.C:
-			return batch, true
-		case <-c.die:
-			return batch, true
+		default:
+			select {
+			case packet := <-c.txCtrl:
+				batch = append(batch, packet)
+			case packet := <-c.txData:
+				batch = append(batch, packet)
+			case <-timer.C:
+				return batch, true
+			case <-c.die:
+				return batch, true
+			}
 		}
 	}
 	return batch, true
+}
+
+func isControlPacket(p []byte) bool {
+	// KCP's PUSH command is 81 and its fixed header is 24 bytes. Walk packed
+	// segments so a datagram containing ACK plus data is still prioritized.
+	for off := 0; off+24 <= len(p); {
+		if p[off+4] != kcpCmdPush {
+			return true
+		}
+		segLen := int(binary.LittleEndian.Uint16(p[off+22 : off+24]))
+		if off+24+segLen > len(p) {
+			return true
+		}
+		off += 24 + segLen
+	}
+	return len(p) == 0 || len(p) < 24
 }
 
 func (c *Conn) pollLoop() {
@@ -223,8 +256,12 @@ func (c *Conn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 	dgram := make([]byte, len(p))
 	copy(dgram, p)
+	queue := c.txData
+	if isControlPacket(dgram) {
+		queue = c.txCtrl
+	}
 	select {
-	case c.tx <- dgram:
+	case queue <- dgram:
 		return len(p), nil
 	case <-c.die:
 		return 0, errClosed

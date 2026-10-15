@@ -30,6 +30,7 @@ func main() {
 	token := flag.String("token", "", "bus auth token (required)")
 	target := flag.String("t", "127.0.0.1:12948", "target addr (unused in proxy mode, kept for compat)")
 	mode := flag.String("mode", "fast", "fast3, fast2, fast, normal, manual")
+	initialRTO := flag.Int("initial-rto", 5000, "initial KCP retransmission timeout in ms for GAS transport")
 	mtu := flag.Int("mtu", 1350, "MTU for KCP datagrams")
 	sndwnd := flag.Int("sndwnd", 1024, "send window (packets)")
 	rcvwnd := flag.Int("rcvwnd", 1024, "receive window (packets)")
@@ -67,7 +68,8 @@ func main() {
 	cfg := &kcpserver.Config{
 		Target: *target, Crypt: "none", Mode: *mode,
 		MTU: *mtu, SndWnd: *sndwnd, RcvWnd: *rcvwnd,
-		DataShard: *ds, ParityShard: *ps, DSCP: *dscp, NoComp: *nocomp,
+		InitialRTO: *initialRTO,
+		DataShard:  *ds, ParityShard: *ps, DSCP: *dscp, NoComp: *nocomp,
 		SockBuf: *sockbuf, StreamBuf: *streambuf, StreamBufEn: *streambufEn,
 		BoostTimeout: *streamboost, MaxFrameSize: *maxframe, PipeBuf: *pipebuf,
 		KeepAlive: *keepalive, KeepAliveMS: *keepalivems, KeepAliveTimeout: *keepaliveTimeout,

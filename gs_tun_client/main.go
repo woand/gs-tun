@@ -26,6 +26,7 @@ func main() {
 	sv := flag.String("sv", "", "target server id (from server's startup log; required when servers use ids)")
 	localAddr := flag.String("l", ":12948", "local TCP listen addr (socks5 proxy)")
 	mode := flag.String("mode", "fast", "fast3, fast2, fast, normal, manual")
+	initialRTO := flag.Int("initial-rto", 5000, "initial KCP retransmission timeout in ms for GAS transport")
 	mtu := flag.Int("mtu", 1350, "MTU for KCP datagrams")
 	sndwnd := flag.Int("sndwnd", 128, "send window (packets)")
 	rcvwnd := flag.Int("rcvwnd", 512, "receive window (packets)")
@@ -60,7 +61,8 @@ func main() {
 	cfg := &kcpclient.Config{
 		LocalAddr: *localAddr, Crypt: "none", Mode: *mode,
 		MTU: *mtu, SndWnd: *sndwnd, RcvWnd: *rcvwnd,
-		DataShard: *ds, ParityShard: *ps, DSCP: *dscp, NoComp: *nocomp,
+		InitialRTO: *initialRTO,
+		DataShard:  *ds, ParityShard: *ps, DSCP: *dscp, NoComp: *nocomp,
 		SockBuf: *sockbuf, StreamBuf: *streambuf, StreamBufEn: *streambufEn,
 		BoostTimeout: *streamboost, MaxFrameSize: *maxframe, PipeBuf: *pipebuf,
 		KeepAlive: *keepalive, KeepAliveMS: *keepalivems, KeepAliveTimeout: *keepaliveTimeout,

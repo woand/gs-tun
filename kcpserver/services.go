@@ -1,6 +1,7 @@
 package kcpserver
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -13,40 +14,75 @@ func replyAndClose(p1 net.Conn, rpy int) {
 	p1.Close()
 }
 
+func readSocksBackend(r io.Reader, h [4]byte) (string, error) {
+	if h[0] != 0x05 || h[1] != 0x01 {
+		return "", fmt.Errorf("unsupported SOCKS5 request")
+	}
+	var host string
+	var portBytes [2]byte
+	switch h[3] {
+	case 0x01:
+		var tail [6]byte
+		if _, err := io.ReadFull(r, tail[:]); err != nil {
+			return "", err
+		}
+		host = net.IPv4(tail[0], tail[1], tail[2], tail[3]).String()
+		portBytes[0], portBytes[1] = tail[4], tail[5]
+	case 0x03:
+		var length [1]byte
+		if _, err := io.ReadFull(r, length[:]); err != nil {
+			return "", err
+		}
+		body := make([]byte, int(length[0])+2)
+		if _, err := io.ReadFull(r, body); err != nil {
+			return "", err
+		}
+		host = string(body[:len(body)-2])
+		portBytes[0], portBytes[1] = body[len(body)-2], body[len(body)-1]
+	case 0x04:
+		var tail [18]byte
+		if _, err := io.ReadFull(r, tail[:]); err != nil {
+			return "", err
+		}
+		host = net.IP(tail[:16]).String()
+		portBytes[0], portBytes[1] = tail[16], tail[17]
+	default:
+		return "", fmt.Errorf("unsupported SOCKS5 address type %d", h[3])
+	}
+	port := int(portBytes[0])<<8 | int(portBytes[1])
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
 func handleFast(p1 net.Conn, quiet bool, buffersize int, tfo bool) {
-	var b [320]byte
-	n, err := p1.Read(b[:])
-	if err != nil {
+	var h [4]byte
+	if _, err := io.ReadFull(p1, h[:]); err != nil {
 		Vlogln(quiet, "[fast client read]", p1, err)
 		return
 	}
-	// b[0:2] // ignore
 
-	var host, port, backend string
-	switch b[3] {
-	case 0x01: //IP V4
-		host = net.IPv4(b[4], b[5], b[6], b[7]).String()
-	case 0x03: //DOMAINNAME
-		host = string(b[5 : n-2]) //b[4] domain name length
-	case 0x04: //IP V6
-		host = net.IP{b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]}.String()
-	case 0x05: //DOMAINNAME + PORT
-		backend = string(b[4 : n])
-		goto CONN
-	default:
-		replyAndClose(p1, 0x08) // X'08' Address type not supported
-		return
+	var backend string
+	var err error
+	if h[3] == 0x05 { // internal HTTP CONNECT framing: header + host:port
+		var b [320]byte
+		n, readErr := p1.Read(b[:])
+		if readErr != nil {
+			Vlogln(quiet, "[fast custom read]", p1, readErr)
+			return
+		}
+		backend = string(b[:n])
+	} else {
+		backend, err = readSocksBackend(p1, h)
+		if err != nil {
+			replyAndClose(p1, 0x08)
+			return
+		}
 	}
-	port = strconv.Itoa(int(b[n-2])<<8 | int(b[n-1]))
-	backend = net.JoinHostPort(host, port)
 
-
-CONN:
 	var p2 net.Conn
 	if tfo {
-		p2, err = handleTFO(p1, backend, 5 * time.Second)
+		p2, err = handleTFO(p1, backend, 5*time.Second)
 	} else {
-		p2, err = net.DialTimeout("tcp", backend, 5 * time.Second)
+		p2, err = net.DialTimeout("tcp", backend, 5*time.Second)
 	}
 	if err != nil {
 		Vlogln(quiet, "[err]", backend, err)
@@ -95,9 +131,9 @@ func handleClient(p1 net.Conn, quiet bool, buffersize int, serv string, target s
 		var p2 net.Conn
 		var err error
 		if tfo {
-			p2, err = handleTFO(p1, target, 5 * time.Second)
+			p2, err = handleTFO(p1, target, 5*time.Second)
 		} else {
-			p2, err = net.DialTimeout("tcp", target, 5 * time.Second)
+			p2, err = net.DialTimeout("tcp", target, 5*time.Second)
 		}
 		if err != nil {
 			Vlogln(quiet, "[connect err]", target, err)
@@ -136,4 +172,3 @@ func Vlogln(quiet bool, v ...interface{}) {
 		log.Println(v...)
 	}
 }
-
