@@ -1,4 +1,4 @@
-    通道不是纯 *.google.com或*.googleapis.com, 还用到了 *.googleusercontent.com,
+    google script通道不是纯 *.google.com或*.googleapis.com, 还用到了 *.googleusercontent.com,
     而firestore.googleapis.com每秒写一次大约 2.8 小时额度耗尽(双向发送数据都需要写入),
     放弃本项目
 
